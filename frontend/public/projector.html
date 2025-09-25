@@ -1,0 +1,316 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Projector</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      html, body { margin:0; height:100%; background:#000; color:#fff; transition:background-color .3s ease; overflow:hidden; }
+      body.whiteout { background:#fff !important; color:#000 !important; }
+      #fsBtn { position:fixed; top:16px; right:16px; z-index:10; padding:10px 14px; }
+      #canvas-container { position:absolute; inset:0; display:flex; justify-content:center; align-items:center; }
+      .canvas-wrapper { position:relative; }
+      /* We'll use WebGL on this canvas instead of 2D */
+      #projection-canvas { background:transparent; image-rendering:pixelated; transition:all .3s ease; }
+      body.whiteout #projection-canvas { background:#fff; }
+      /* kept for legacy, hidden when using homography */
+      #overlay-image {
+        position:absolute; top:50%; left:50%;
+        transform:translate(-50%, -50%);
+        pointer-events:none; z-index:10; display:none;
+        max-width:none; max-height:none; image-rendering:pixelated;
+      }
+      #status { position:fixed; bottom:20px; left:20px; font-size:12px; padding:8px 12px; background:rgba(0,0,0,.7); border-radius:6px; opacity:.8; z-index:5; }
+      #debug  { position:fixed; top:20px; left:20px; font-size:11px; background:rgba(0,0,0,.8); color:#0f0; padding:8px; border-radius:4px; font-family:monospace; max-width:300px; z-index:5; }
+    </style>
+  </head>
+  <body>
+    <button id="fsBtn">Enter Fullscreen</button>
+
+    <div id="canvas-container">
+      <div class="canvas-wrapper">
+        <canvas id="projection-canvas"></canvas>
+        <img id="overlay-image" alt="Projection content" />
+      </div>
+    </div>
+
+    <div id="status">
+      <div id="modeStatus">Projection Mode: Normal</div>
+      <div id="connectionStatus">Connection: Waiting...</div>
+      <div id="canvasResolution">Canvas: 800x600</div>
+    </div>
+
+    <div id="debug">
+      <div>Debug Messages:</div>
+      <div id="debugMessages"></div>
+    </div>
+
+    <script>
+      const fsBtn = document.getElementById("fsBtn");
+      const modeStatus = document.getElementById("modeStatus");
+      const connectionStatus = document.getElementById("connectionStatus");
+      const canvasResolutionDiv = document.getElementById("canvasResolution");
+      const debugMessages = document.getElementById("debugMessages");
+      const projectionCanvas = document.getElementById("projection-canvas");
+      const overlayImage = document.getElementById("overlay-image");
+
+      // ---------- WebGL (homography) ----------
+      let gl, prog, posBuf, uvBuf, tex, imageLoaded = false;
+      let currentCorners = null; // [{x,y} ...] in canvas px relative to center (SAME as main app)
+      let currentImage = null;
+      let currentZoom = 0; // kept for legacy overlay path
+
+      const VS = `
+        attribute vec2 a_position;
+        attribute vec2 a_texcoord;
+        varying vec2 v_texcoord;
+        void main(){
+          gl_Position = vec4(a_position, 0.0, 1.0);
+          v_texcoord = a_texcoord;
+        }
+      `;
+      const FS = `
+        precision mediump float;
+        varying vec2 v_texcoord;
+        uniform sampler2D u_tex;
+        void main(){
+          gl_FragColor = texture2D(u_tex, v_texcoord);
+        }
+      `;
+
+      function addDebugMessage(msg) {
+        const t = new Date().toLocaleTimeString();
+        debugMessages.innerHTML = `${t}: ${msg}<br>` + debugMessages.innerHTML;
+        const lines = debugMessages.innerHTML.split('<br>');
+        if (lines.length > 50) debugMessages.innerHTML = lines.slice(0, 50).join('<br>');
+      }
+
+      function ensureGL(){
+        if (gl) return;
+        gl = projectionCanvas.getContext('webgl', { alpha:true, premultipliedAlpha:false });
+        if (!gl) { addDebugMessage('WebGL not supported'); return; }
+
+        const compile = (type, src) => {
+          const sh = gl.createShader(type);
+          gl.shaderSource(sh, src);
+          gl.compileShader(sh);
+          if (!gl.getShaderParameter(sh, gl.COMPLETE_STATUS) && !gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+            throw new Error(gl.getShaderInfoLog(sh));
+          }
+          return sh;
+        };
+        const vs = compile(gl.VERTEX_SHADER, VS);
+        const fs = compile(gl.FRAGMENT_SHADER, FS);
+        prog = gl.createProgram();
+        gl.attachShader(prog, vs);
+        gl.attachShader(prog, fs);
+        gl.linkProgram(prog);
+        if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+
+        prog.a_position = gl.getAttribLocation(prog, 'a_position');
+        prog.a_texcoord = gl.getAttribLocation(prog, 'a_texcoord');
+        prog.u_tex      = gl.getUniformLocation(prog, 'u_tex');
+
+        posBuf = gl.createBuffer();
+        uvBuf  = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, uvBuf);
+        const uvs = new Float32Array([
+          0,0,  0,1,  1,0,
+          1,0,  0,1,  1,1,
+        ]);
+        gl.bufferData(gl.ARRAY_BUFFER, uvs, gl.STATIC_DRAW);
+
+        addDebugMessage('WebGL initialized');
+      }
+
+      function loadTexture(url){
+        ensureGL();
+        if (!gl) return;
+
+        imageLoaded = false;
+        const img = new Image();
+        img.crossOrigin = 'anonymous';
+        img.src = url;
+        img.onload = () => {
+          if (!tex) tex = gl.createTexture();
+          gl.bindTexture(gl.TEXTURE_2D, tex);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+          imageLoaded = true;
+          drawGL();
+          addDebugMessage('Texture loaded');
+        };
+      }
+
+      function ndcFromCorner(pt){
+        // corners are in canvas px relative to center
+        const w2 = projectionCanvas.width  / 2;
+        const h2 = projectionCanvas.height / 2;
+        return [ pt.x / w2, -pt.y / h2 ];
+      }
+
+      function drawGL(){
+        if (!gl || !imageLoaded || !currentCorners || currentCorners.length !== 4) return;
+        if (document.body.classList.contains('whiteout')) return;
+
+        gl.viewport(0,0,projectionCanvas.width, projectionCanvas.height);
+        gl.disable(gl.DEPTH_TEST);
+        gl.clearColor(0,0,0,0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+
+        const [TL, BL, TR, BR] = currentCorners;
+        const [tlx,tly] = ndcFromCorner(TL);
+        const [blx,bly] = ndcFromCorner(BL);
+        const [trx,try_] = ndcFromCorner(TR);
+        const [brx,bry] = ndcFromCorner(BR);
+
+        const positions = new Float32Array([
+          tlx,tly,  blx,bly,  trx,try_,
+          trx,try_, blx,bly,  brx,bry,
+        ]);
+
+        gl.useProgram(prog);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+        gl.bufferData(gl.ARRAY_BUFFER, positions, gl.DYNAMIC_DRAW);
+        gl.enableVertexAttribArray(prog.a_position);
+        gl.vertexAttribPointer(prog.a_position, 2, gl.FLOAT, false, 0, 0);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, uvBuf);
+        gl.enableVertexAttribArray(prog.a_texcoord);
+        gl.vertexAttribPointer(prog.a_texcoord, 2, gl.FLOAT, false, 0, 0);
+
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.uniform1i(prog.u_tex, 0);
+
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
+      }
+
+      // ---------- existing utility ----------
+      let canvasResolution = "800x600";
+
+      function setWhiteout(isOn) {
+        if (isOn) {
+          document.body.classList.add('whiteout');
+          modeStatus.textContent = "Projection Mode: Whiteout";
+          overlayImage.style.display = 'none';
+          // Fill white via CSS bg; GL stays untouched
+        } else {
+          document.body.classList.remove('whiteout');
+          modeStatus.textContent = "Projection Mode: Normal";
+          drawGL();
+        }
+      }
+
+      const urlParams = new URLSearchParams(window.location.search);
+      const urlWhiteout = urlParams.get('whiteout') === 'true';
+      setWhiteout(urlWhiteout);
+
+      function parseResolution(s) {
+        const p = s.split('x'); if (p.length !== 2) return [800,600];
+        const w = Math.max(100, Math.min(parseInt(p[0])||800, 7680));
+        const h = Math.max(100, Math.min(parseInt(p[1])||600, 4320));
+        return [w,h];
+      }
+
+      function updateCanvasSize(res) {
+        const [w,h] = parseResolution(res);
+        projectionCanvas.width = w;
+        projectionCanvas.height = h;
+        projectionCanvas.style.width  = w + 'px';
+        projectionCanvas.style.height = h + 'px';
+        canvasResolution = res;
+        canvasResolutionDiv.textContent = `Canvas: ${res}`;
+        addDebugMessage(`Canvas updated: ${w}x${h}`);
+        drawGL();
+      }
+
+      // ---------- messaging ----------
+      window.addEventListener('message', (event) => {
+        const data = event.data;
+        connectionStatus.textContent = "Connection: Active";
+        if (!data || typeof data !== 'object') return;
+        const { type, value } = data;
+
+        switch(type) {
+          case 'whiteout':
+            setWhiteout(!!value);
+            break;
+
+          case 'zoom': // legacy path (only if using overlay image fallback)
+            currentZoom = Number(value) || 0;
+            break;
+
+          case 'image':
+            if (typeof value === 'string') {
+              currentImage = value;
+              loadTexture(currentImage);        // WebGL texture
+              overlayImage.style.display = 'none'; // ensure hidden when using homography
+            } else {
+              currentImage = null;
+              imageLoaded = false;
+              overlayImage.style.display = 'none';
+               if (gl) {
+                gl.viewport(0, 0, projectionCanvas.width, projectionCanvas.height);
+                gl.disable(gl.DEPTH_TEST);
+                gl.clearColor(0, 0, 0, 1);   // opaque black so projector goes dark
+                gl.clear(gl.COLOR_BUFFER_BIT);
+              }
+            }
+            break;
+
+          case 'resolution':
+            updateCanvasSize(value);
+            break;
+
+          // NEW: receive homography corners and redraw
+          case 'corners':
+            if (Array.isArray(value) && value.length === 4) {
+              currentCorners = value.map(p => ({ x: Number(p.x)||0, y: Number(p.y)||0 }));
+              drawGL();
+            }
+            break;
+        }
+      });
+
+      // Initial canvas size
+      updateCanvasSize("800x600");
+
+      // ---------- fullscreen / debug ----------
+      fsBtn.addEventListener("click", async () => {
+        try {
+          await document.documentElement.requestFullscreen({ navigationUI: "hide" });
+          fsBtn.style.display = "none";
+          document.getElementById("status").style.display = "none";
+          document.getElementById("debug").style.display = "none";
+        } catch (e) { addDebugMessage("Fullscreen failed"); }
+      });
+
+      document.addEventListener("fullscreenchange", () => {
+        const on = !!document.fullscreenElement;
+        fsBtn.style.display = on ? "none" : "block";
+        document.getElementById("status").style.display = on ? "none" : "block";
+        document.getElementById("debug").style.display = on ? "none" : "block";
+      });
+
+      document.addEventListener("keydown", (e) => {
+        if (e.key.toLowerCase() === "w") {
+          const nowOn = !document.body.classList.contains('whiteout');
+          setWhiteout(nowOn);
+        }
+        if (e.key.toLowerCase() === "d") {
+          const dbg = document.getElementById("debug");
+          dbg.style.display = dbg.style.display === "none" ? "block" : "none";
+        }
+      });
+
+      if (window.opener) {
+        window.opener.postMessage({ type: 'projector-ready' }, "*");
+      }
+    </script>
+  </body>
+</html>
